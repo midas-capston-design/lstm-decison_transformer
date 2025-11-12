@@ -268,7 +268,9 @@ def train_decision_transformer():
     print("\n[1/5] 데이터 로드...")
 
     # v3 데이터 로드 (또는 fuzzy 데이터)
-    data_dir = Path('processed_data_v3')
+    # 스크립트가 프로젝트 루트에서 실행된다고 가정
+    script_dir = Path(__file__).parent.parent  # decision_transformer의 부모 = 프로젝트 루트
+    data_dir = script_dir / 'v3' / 'processed_data_v3'
 
     X_train = np.load(data_dir / 'X_train.npy')
     y_train = np.load(data_dir / 'y_train.npy')
@@ -277,19 +279,18 @@ def train_decision_transformer():
     X_test = np.load(data_dir / 'X_test.npy')
     y_test = np.load(data_dir / 'y_test.npy')
 
+    # 정규화된 좌표 데이터 로드 (범위: [-1, 1])
+    train_positions = np.load(data_dir / 'coords_train_norm.npy')
+    val_positions = np.load(data_dir / 'coords_val_norm.npy')
+    test_positions = np.load(data_dir / 'coords_test_norm.npy')
+
     with open(data_dir / 'metadata.pkl', 'rb') as f:
         metadata = pickle.load(f)
 
     print(f"  Train: {X_train.shape}")
     print(f"  Val:   {X_val.shape}")
     print(f"  Test:  {X_test.shape}")
-
-    # 라벨을 좌표로 변환 (여기서는 간단히 grid ID를 좌표로 역변환)
-    # 실제로는 metadata의 grid_to_idx를 역으로 사용
-    # 여기서는 임시로 랜덤 좌표 생성 (실제로는 정확한 좌표 필요)
-    train_positions = np.random.randn(len(y_train), 2) * 10
-    val_positions = np.random.randn(len(y_val), 2) * 10
-    test_positions = np.random.randn(len(y_test), 2) * 10
+    print(f"  좌표 범위: [{train_positions.min():.2f}, {train_positions.max():.2f}]")
 
     print("\n[2/5] 데이터셋 생성...")
     train_dataset = TrajectoryDataset(X_train, train_positions, CONFIG['context_length'])
@@ -329,6 +330,10 @@ def train_decision_transformer():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     print("\n[4/5] 학습 시작...")
+    print(f"  총 {CONFIG['epochs']} epochs")
+    print(f"  배치 크기: {CONFIG['batch_size']}")
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Val batches: {len(val_loader)}")
 
     best_val_loss = float('inf')
     step = 0
@@ -338,7 +343,12 @@ def train_decision_transformer():
         model.train()
         train_loss = 0.0
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx == 0:
+                print(f"\nEpoch {epoch+1}/{CONFIG['epochs']} - 첫 배치 처리 중...")
+
+            if batch_idx % 100 == 0 and batch_idx > 0:
+                print(f"  Batch {batch_idx}/{len(train_loader)}", end='\r')
             states = batch['states'].to(DEVICE)
             actions = batch['actions'].to(DEVICE)
             rtg = batch['returns_to_go'].to(DEVICE)
@@ -387,13 +397,18 @@ def train_decision_transformer():
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            # 모델 저장 디렉토리 생성
+            model_dir = script_dir / 'models'
+            model_dir.mkdir(exist_ok=True)
+
+            model_path = model_dir / 'decision_transformer_best.pt'
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'config': CONFIG,
-            }, 'models/decision_transformer_best.pt')
+            }, model_path)
 
     print("\n[5/5] 학습 완료!")
     print(f"  최고 Val Loss: {best_val_loss:.4f}")
