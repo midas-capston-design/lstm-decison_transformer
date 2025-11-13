@@ -28,7 +28,7 @@ class SensorEncoder(nn.Module):
         self.input_proj = nn.Linear(input_dim, d_model)
 
         # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=200)
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=300)  # 250 timesteps 지원
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -276,8 +276,72 @@ class FlowMatchingLocalization(nn.Module):
         else:
             return x
 
+    @torch.no_grad()
+    def sample_topk(self, sensor_data, n_samples=10, k=5, n_steps=10):
+        """
+        Top-k sampling: 여러 노이즈에서 샘플링 후 신뢰도 높은 k개 중 최고 1개 선택
 
-def compute_flow_matching_loss(model, sensor_data, target_positions):
+        Args:
+            sensor_data: (B, T, 6) - sensor sequence
+            n_samples: 총 샘플링 횟수
+            k: 후보 개수 (이 중 최고 신뢰도 1개 선택)
+            n_steps: ODE step 수
+
+        Returns:
+            positions: (B, 2) - 최고 신뢰도 위치
+            topk_positions: (B, k, 2) - top-k 후보 위치들
+            topk_scores: (B, k) - top-k 신뢰도 점수들
+        """
+        B = sensor_data.shape[0]
+        device = sensor_data.device
+
+        # Encode sensor data once
+        context = self.encoder(sensor_data)  # (B, d_model)
+
+        all_positions = []
+        all_scores = []
+
+        # 여러 노이즈에서 샘플링
+        for _ in range(n_samples):
+            # 각 샘플마다 다른 노이즈에서 시작
+            pos = self.sample(sensor_data, n_steps=n_steps)  # (B, 2)
+            all_positions.append(pos)
+
+            # 신뢰도 점수 계산: 최종 velocity의 크기가 작을수록 수렴했다는 의미
+            t_final = torch.ones(B, device=device)
+            v_final = self.velocity_net(pos, t_final, context)
+            score = -torch.norm(v_final, dim=1)  # (B,) - 낮은 velocity = 높은 점수
+            all_scores.append(score)
+
+        # Stack: (B, n_samples, 2), (B, n_samples)
+        all_positions = torch.stack(all_positions, dim=1)
+        all_scores = torch.stack(all_scores, dim=1)
+
+        # 각 배치별로 top-k 선택
+        best_positions = []
+        topk_positions_list = []
+        topk_scores_list = []
+
+        for b in range(B):
+            # b번째 샘플의 top-k 인덱스 (신뢰도 높은 순)
+            topk_scores_b, topk_idx = torch.topk(all_scores[b], k)
+            topk_pos_b = all_positions[b, topk_idx]  # (k, 2)
+
+            # Top-k 중 최고 신뢰도 (첫 번째) 선택
+            best_pos = topk_pos_b[0]  # (2,)
+
+            best_positions.append(best_pos)
+            topk_positions_list.append(topk_pos_b)
+            topk_scores_list.append(topk_scores_b)
+
+        best_positions = torch.stack(best_positions, dim=0)  # (B, 2)
+        topk_positions = torch.stack(topk_positions_list, dim=0)  # (B, k, 2)
+        topk_scores = torch.stack(topk_scores_list, dim=0)  # (B, k)
+
+        return best_positions, topk_positions, topk_scores
+
+
+def compute_flow_matching_loss(model, sensor_data, target_positions, use_topk=False, k_ratio=0.5):
     """
     Compute Flow Matching training loss
 
@@ -287,6 +351,8 @@ def compute_flow_matching_loss(model, sensor_data, target_positions):
         model: FlowMatchingLocalization model
         sensor_data: (B, T, 6) - sensor sequences
         target_positions: (B, 2) - true positions
+        use_topk: if True, use top-k hard example mining
+        k_ratio: ratio of samples to use (0.5 = top 50% hardest samples)
 
     Returns:
         loss: scalar loss value
@@ -313,8 +379,15 @@ def compute_flow_matching_loss(model, sensor_data, target_positions):
     # Predicted velocity
     pred_velocity = model(x_t, t, sensor_data)
 
-    # MSE loss
-    loss = F.mse_loss(pred_velocity, true_velocity)
+    if use_topk:
+        # Top-k Loss: 가장 어려운 샘플들에 집중
+        losses = F.mse_loss(pred_velocity, true_velocity, reduction='none').mean(dim=1)  # (B,)
+        k = max(1, int(B * k_ratio))
+        topk_losses, _ = torch.topk(losses, k)
+        loss = topk_losses.mean()
+    else:
+        # MSE loss
+        loss = F.mse_loss(pred_velocity, true_velocity)
 
     return loss
 

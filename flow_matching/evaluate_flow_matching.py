@@ -81,7 +81,7 @@ def evaluate():
 
     print("\n[2/5] Test 데이터 로드...")
 
-    data_dir = Path(__file__).parent.parent / 'processed_data_dt'
+    data_dir = Path(__file__).resolve().parent.parent / 'dt' / 'processed_data_dt'
 
     states_test = np.load(data_dir / 'states_test.npy')
     traj_test = np.load(data_dir / 'trajectories_test.npy')

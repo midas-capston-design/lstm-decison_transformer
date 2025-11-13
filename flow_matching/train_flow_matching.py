@@ -37,15 +37,30 @@ CONFIG = {
     'n_heads': 8,
     'dropout': 0.1,
 
+    # Data (5걸음 기준: 250 timesteps)
+    'sequence_length': 250,  # 100 → 250 (5초, 약 5걸음)
+
     # Training
     'batch_size': 64,
     'learning_rate': 1e-4,
     'weight_decay': 1e-4,
-    'epochs': 50,
-    'warmup_steps': 2000,
+    'epochs': 100,  # 늘림: 50 → 100
+    'warmup_steps': 4000,  # Warmup 늘림: 2000 → 4000 (천천히 시작)
+    'early_stopping_patience': 10,  # 10 epoch 동안 개선 없으면 조기 종료 (과적합 방지)
+
+    # Top-k Loss (Hard Example Mining)
+    'use_topk_loss': True,
+    'topk_ratio': 0.5,  # 상위 50% 어려운 샘플에 집중
+
+    # Data Augmentation (전처리 시 적용됨, Train only)
+    'augment_train': False,  # 전처리에서 이미 적용됨
+    'mag_noise_std': 0.8,      # (사용 안 함)
+    'orient_noise_std': 1.5,   # (사용 안 함)
 
     # Inference
     'inference_steps': 10,  # Can use 1-2 for real-time
+    'topk_samples': 10,  # Top-k sampling: 총 샘플 수
+    'topk_k': 5,  # Top-k sampling: 선택할 개수 (10개 중 상위 5개)
 }
 
 print("\n설정:")
@@ -53,30 +68,94 @@ for key, value in CONFIG.items():
     print(f"  {key}: {value}")
 
 # ============================================================================
-# Dataset
+# Dataset with Real-time Augmentation
 # ============================================================================
+def augment_sensor_data(sensor_data, mag_noise_std=0.8, orient_noise_std=1.5):
+    """
+    센서 데이터 실시간 증강 (Train only)
+
+    시퀀셜 데이터 특성을 고려한 증강:
+    1. Drift (전체 시퀀스 바이어스) - 시간 불변
+    2. Smooth noise (시간적으로 연속적인 노이즈)
+
+    증강 방법:
+    1. 지자기 센서 노이즈 (MagX, MagY, MagZ)
+       - 70% drift: 전체 시퀀스에 동일한 바이어스 (센서 캘리브레이션 오차)
+       - 30% smooth noise: 시간적으로 연속적인 노이즈 (측정 오차)
+
+    2. 방향 센서 노이즈 (Pitch, Roll, Yaw)
+       - 70% drift: 전체 시퀀스에 동일한 바이어스 (자세 추정 오차)
+       - 30% smooth noise: 시간적으로 연속적인 노이즈 (각속도 누적 오차)
+
+    증강 비율:
+    - Train: 매 epoch마다 100% 샘플에 실시간 증강 적용
+    - Val/Test: 증강 없음 (원본 데이터만)
+
+    Args:
+        sensor_data: (100, 6) - [MagX, MagY, MagZ, Pitch, Roll, Yaw]
+        mag_noise_std: 지자기 노이즈 표준편차 (μT)
+        orient_noise_std: 방향 노이즈 표준편차 (도)
+
+    Returns:
+        augmented sensor_data: (100, 6)
+    """
+    sensor_data = sensor_data.clone()
+    T = sensor_data.shape[0]
+
+    # 지자기 센서 노이즈 (MagX, MagY, MagZ)
+    # 70% drift + 30% smooth noise
+    mag_drift = torch.randn(3) * mag_noise_std * 0.7  # (3,)
+    mag_smooth = torch.randn(T, 3) * mag_noise_std * 0.3  # (T, 3)
+    sensor_data[:, 0:3] += mag_drift + mag_smooth
+
+    # 방향 센서 노이즈 (Pitch, Roll, Yaw)
+    # 70% drift + 30% smooth noise
+    orient_drift = torch.randn(3) * orient_noise_std * 0.7  # (3,)
+    orient_smooth = torch.randn(T, 3) * orient_noise_std * 0.3  # (T, 3)
+    sensor_data[:, 3:6] += orient_drift + orient_smooth
+
+    return sensor_data
+
+
 class FlowMatchingDataset(Dataset):
     """
-    Flow Matching용 데이터셋
+    Flow Matching용 데이터셋 (실시간 증강 지원)
 
     Input: 센서 시퀀스 (100, 6)
     Target: 마지막 위치 (2,)
     """
-    def __init__(self, states, trajectories):
+    def __init__(self, states, trajectories, augment=False,
+                 mag_noise_std=0.8, orient_noise_std=1.5):
         """
         Args:
             states: (N, 100, 6) - 센서 데이터
             trajectories: (N, 100, 2) - 각 timestep의 위치
+            augment: Train 시에만 True
+            mag_noise_std: 지자기 노이즈 표준편차
+            orient_noise_std: 방향 노이즈 표준편차
         """
         self.states = torch.FloatTensor(states)
         self.positions = torch.FloatTensor(trajectories[:, -1, :])  # 마지막 위치만
+        self.augment = augment
+        self.mag_noise_std = mag_noise_std
+        self.orient_noise_std = orient_noise_std
 
     def __len__(self):
         return len(self.states)
 
     def __getitem__(self, idx):
+        sensor_data = self.states[idx]  # (100, 6)
+
+        # Train 시에만 증강 적용
+        if self.augment:
+            sensor_data = augment_sensor_data(
+                sensor_data,
+                self.mag_noise_std,
+                self.orient_noise_std
+            )
+
         return {
-            'sensor_data': self.states[idx],      # (100, 6)
+            'sensor_data': sensor_data,           # (100, 6)
             'position': self.positions[idx],       # (2,)
         }
 
@@ -86,20 +165,38 @@ class FlowMatchingDataset(Dataset):
 def train():
     print("\n[1/6] 데이터 로드...")
 
-    data_dir = Path(__file__).parent.parent / 'processed_data_dt'
+    # 새로운 전처리 데이터 사용 (Train에만 시퀀셜 증강 적용됨)
+    data_dir = Path(__file__).parent / 'processed_data_flow_matching'
 
-    states_train = np.load(data_dir / 'states_train.npy')
-    traj_train = np.load(data_dir / 'trajectories_train.npy')
+    states_train = np.load(data_dir / 'states_train.npy', allow_pickle=True)
+    traj_train = np.load(data_dir / 'trajectories_train.npy', allow_pickle=True)
 
-    states_val = np.load(data_dir / 'states_val.npy')
-    traj_val = np.load(data_dir / 'trajectories_val.npy')
+    states_val = np.load(data_dir / 'states_val.npy', allow_pickle=True)
+    traj_val = np.load(data_dir / 'trajectories_val.npy', allow_pickle=True)
 
     print(f"  Train: {states_train.shape}")
     print(f"  Val:   {states_val.shape}")
 
     print("\n[2/6] 데이터셋 생성...")
-    train_dataset = FlowMatchingDataset(states_train, traj_train)
-    val_dataset = FlowMatchingDataset(states_val, traj_val)
+    # Train: 실시간 증강 ON
+    train_dataset = FlowMatchingDataset(
+        states_train, traj_train,
+        augment=CONFIG['augment_train'],
+        mag_noise_std=CONFIG['mag_noise_std'],
+        orient_noise_std=CONFIG['orient_noise_std']
+    )
+    # Val: 증강 OFF (원본 데이터만)
+    val_dataset = FlowMatchingDataset(
+        states_val, traj_val,
+        augment=False
+    )
+
+    print(f"  ✅ Train: 실시간 증강 {'활성화' if CONFIG['augment_train'] else '비활성화'}")
+    if CONFIG['augment_train']:
+        print(f"     - 지자기 노이즈: std={CONFIG['mag_noise_std']}μT")
+        print(f"     - 방향 노이즈: std={CONFIG['orient_noise_std']}°")
+        print(f"     - 증강 비율: 매 epoch 100% 샘플")
+    print(f"  ✅ Val: 원본 데이터만 사용")
 
     train_loader = DataLoader(
         train_dataset,
@@ -153,8 +250,11 @@ def train():
     print("\n[5/6] 학습 시작...")
     print(f"  Epochs: {CONFIG['epochs']}")
     print(f"  Batch size: {CONFIG['batch_size']}")
+    print(f"  Early stopping patience: {CONFIG['early_stopping_patience']}")
 
     best_val_loss = float('inf')
+    patience_counter = 0
+    best_epoch = 0
 
     for epoch in range(CONFIG['epochs']):
         # ========== Training ==========
@@ -166,8 +266,12 @@ def train():
             sensor_data = batch['sensor_data'].to(DEVICE)
             positions = batch['position'].to(DEVICE)
 
-            # Flow Matching loss
-            loss = compute_flow_matching_loss(model, sensor_data, positions)
+            # Flow Matching loss (with Top-k)
+            loss = compute_flow_matching_loss(
+                model, sensor_data, positions,
+                use_topk=CONFIG['use_topk_loss'],
+                k_ratio=CONFIG['topk_ratio']
+            )
 
             # Backward
             optimizer.zero_grad()
@@ -185,6 +289,7 @@ def train():
         model.eval()
         val_loss = 0.0
         val_position_error = 0.0
+        val_position_error_topk = 0.0
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{CONFIG['epochs']} [Val]", leave=False):
@@ -192,7 +297,11 @@ def train():
                 positions = batch['position'].to(DEVICE)
 
                 # Flow Matching loss
-                loss = compute_flow_matching_loss(model, sensor_data, positions)
+                loss = compute_flow_matching_loss(
+                    model, sensor_data, positions,
+                    use_topk=CONFIG['use_topk_loss'],
+                    k_ratio=CONFIG['topk_ratio']
+                )
                 val_loss += loss.item()
 
                 # Position error (using sampling)
@@ -200,17 +309,36 @@ def train():
                 error = torch.norm(pred_positions - positions, dim=1).mean()
                 val_position_error += error.item()
 
+                # Position error with Top-k sampling
+                best_pos, topk_positions, topk_scores = model.sample_topk(
+                    sensor_data,
+                    n_samples=CONFIG['topk_samples'],
+                    k=CONFIG['topk_k'],
+                    n_steps=CONFIG['inference_steps']
+                )
+                # 최고 신뢰도 위치 오차
+                error_topk = torch.norm(best_pos - positions, dim=1).mean()
+                val_position_error_topk += error_topk.item()
+
         val_loss /= len(val_loader)
         val_position_error /= len(val_loader)
+        val_position_error_topk /= len(val_loader)
+
+        # 1 Grid 이내 정확도 계산 (주변 1칸 포함)
+        grid_size_normalized = CONFIG.get('grid_size_normalized', 0.9 / 85.5)  # 정규화된 grid 크기
 
         print(f"Epoch {epoch+1:3d} | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
-              f"Val Pos Error: {val_position_error:.4f}")
+              f"Val Pos Error: {val_position_error:.4f} | "
+              f"Val Pos Error (Top-k): {val_position_error_topk:.4f}")
 
-        # Save best model
+        # Save best model & Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch + 1
+            patience_counter = 0
+
             model_dir = Path(__file__).parent.parent / 'models'
             model_dir.mkdir(exist_ok=True)
 
@@ -219,12 +347,112 @@ def train():
                 'model_state_dict': model.state_dict(),
                 'val_loss': val_loss,
                 'val_position_error': val_position_error,
+                'val_position_error_topk': val_position_error_topk,
                 'config': CONFIG,
             }, model_dir / 'flow_matching_best.pt')
+            print(f"  ✅ Best model saved! (Val Loss: {val_loss:.4f})")
+        else:
+            patience_counter += 1
+            print(f"  ⏳ No improvement for {patience_counter} epoch(s)")
+
+            if patience_counter >= CONFIG['early_stopping_patience']:
+                print(f"\n⛔ Early stopping triggered! No improvement for {CONFIG['early_stopping_patience']} epochs.")
+                print(f"  Best epoch: {best_epoch}")
+                print(f"  Best val loss: {best_val_loss:.4f}")
+                break
 
     print("\n[6/6] 학습 완료!")
     print(f"  최고 Val Loss: {best_val_loss:.4f}")
     print(f"  모델 저장: models/flow_matching_best.pt")
+
+    # ========== Test Evaluation ==========
+    print("\n" + "=" * 70)
+    print("📊 Test 데이터 평가")
+    print("=" * 70)
+
+    # Test 데이터 로드
+    states_test = np.load(data_dir / 'states_test.npy', allow_pickle=True)
+    traj_test = np.load(data_dir / 'trajectories_test.npy', allow_pickle=True)
+
+    test_dataset = FlowMatchingDataset(states_test, traj_test, augment=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if DEVICE.type == 'cuda' else False
+    )
+
+    print(f"\nTest 샘플: {len(test_dataset):,}개")
+
+    # Best model 로드
+    checkpoint = torch.load(model_dir / 'flow_matching_best.pt')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    # Test 평가
+    test_position_error = 0.0
+    test_position_error_topk = 0.0
+    test_within_1grid = 0
+    test_within_1grid_topk = 0
+    total_samples = 0
+
+    # Grid size (정규화된 좌표 기준)
+    # 원본: 0.9m, 건물 범위: 85.5m
+    grid_size_normalized = 0.9 / 85.5 * 2  # 정규화된 좌표는 -1~1 범위 (2배)
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Test Evaluation"):
+            sensor_data = batch['sensor_data'].to(DEVICE)
+            positions = batch['position'].to(DEVICE)
+
+            # 일반 sampling
+            pred_positions = model.sample(sensor_data, n_steps=CONFIG['inference_steps'])
+            error = torch.norm(pred_positions - positions, dim=1)
+            test_position_error += error.sum().item()
+
+            # 1 Grid 이내 정확도
+            within_1grid = (error <= grid_size_normalized).sum().item()
+            test_within_1grid += within_1grid
+
+            # Top-k sampling (5개 후보 모두 평가)
+            best_pos, topk_positions, topk_scores = model.sample_topk(
+                sensor_data,
+                n_samples=CONFIG['topk_samples'],
+                k=CONFIG['topk_k'],
+                n_steps=CONFIG['inference_steps']
+            )
+            # best_pos: (B, 2) - 최고 신뢰도 위치
+            # topk_positions: (B, 5, 2) - 5개 후보
+
+            # 최고 신뢰도 위치 오차
+            error_topk = torch.norm(best_pos - positions, dim=1)
+            test_position_error_topk += error_topk.sum().item()
+
+            # 1 Grid 이내 정확도 (Top-5 중 하나라도 맞으면 정답)
+            for b in range(len(positions)):
+                # b번째 샘플의 5개 후보 각각 확인
+                target_pos = positions[b]  # (2,)
+                candidates = topk_positions[b]  # (5, 2)
+
+                # 5개 중 하나라도 1 Grid 이내면 정답
+                errors = torch.norm(candidates - target_pos, dim=1)  # (5,)
+                if (errors <= grid_size_normalized).any():
+                    test_within_1grid_topk += 1
+
+            total_samples += len(positions)
+
+    test_position_error /= total_samples
+    test_position_error_topk /= total_samples
+    test_acc_1grid = test_within_1grid / total_samples * 100
+    test_acc_1grid_topk = test_within_1grid_topk / total_samples * 100
+
+    print(f"\n📊 Test 결과:")
+    print(f"  평균 위치 오차 (일반): {test_position_error:.4f} (정규화 단위)")
+    print(f"  평균 위치 오차 (Top-k 최고 신뢰도): {test_position_error_topk:.4f} (정규화 단위)")
+    print(f"\n  🎯 1 Grid(0.9m) 이내 정확도:")
+    print(f"    일반 샘플링 (1개): {test_acc_1grid:.2f}% ({test_within_1grid}/{total_samples})")
+    print(f"    Top-5 후보 (5개 중 하나라도): {test_acc_1grid_topk:.2f}% ({test_within_1grid_topk}/{total_samples})")
 
     # ========== Test Sampling Speed ==========
     print("\n" + "=" * 70)
@@ -257,6 +485,8 @@ def train():
 
 🔥 독창성:
   ✅ 지자기 기반 인도어 포지셔닝에 Flow Matching 첫 적용
+  ✅ Top-k Loss로 어려운 샘플에 집중 학습
+  ✅ Top-k Sampling으로 안정적인 위치 예측
   ✅ 1-2 step inference로 실시간 가능
   ✅ Conditional generation으로 센서 → 위치 매핑
 

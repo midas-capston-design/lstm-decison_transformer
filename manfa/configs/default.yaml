@@ -1,0 +1,44 @@
+seed: 42
+device: null  # auto-select
+
+data:
+  root: flow_matching/processed_data_flow_matching
+  split: train
+  window_size: 250
+  stride: 50
+  variance_thresh: 5e-4
+  yaw_flip_thresh_deg: 30.0
+  arc_over_net_tol: 2.0
+
+field:
+  hidden_dim: 256
+  num_layers: 4
+  fourier_features: 32
+  dropout: 0.1
+  output_variance: true
+
+encoder:
+  d_model: 160
+  num_layers: 3
+  d_state: 48
+  d_conv: 4
+  expand: 2
+  dropout: 0.1
+
+flow:
+  num_particles: 12
+  num_steps: 2
+  noise_std: 0.06
+  entropy_reg: 0.03
+
+optim:
+  lr: 0.0002
+  weight_decay: 1.0e-5
+  batch_size: 12
+  epochs: 60
+  grad_clip: 1.0
+
+loss:
+  lambda_field: 1.0
+  lambda_contrastive: 0.4
+  lambda_particle: 0.7
