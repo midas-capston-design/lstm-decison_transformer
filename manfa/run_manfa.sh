@@ -13,13 +13,13 @@ OUTPUT_PATH=${6:-results/manfa/predictions.jsonl}
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 echo ">>> Stage 1: Neural Field + Encoder pre-training"
-python -m manfa.train \
+python3 -m manfa.train \
   --config "${CONFIG_PATH}" \
   --stage field \
   --save-dir "${FIELD_DIR}"
 
 echo ">>> Stage 2: Full MaNFA training (particle flow 포함)"
-python -m manfa.train \
+python3 -m manfa.train \
   --config "${CONFIG_PATH}" \
   --stage full \
   --save-dir "${FULL_DIR}"
@@ -33,7 +33,7 @@ fi
 echo ">>> Inference checkpoint: ${CHECKPOINT_PATH}"
 
 echo ">>> Stage 3: Streaming inference on ${SPLIT} split"
-python -m manfa.inference \
+python3 -m manfa.inference \
   --config "${CONFIG_PATH}" \
   --checkpoint "${CHECKPOINT_PATH}" \
   --window-dir "${WINDOW_DIR}" \
