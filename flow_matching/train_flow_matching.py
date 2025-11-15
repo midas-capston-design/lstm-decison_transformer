@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import math
+import pickle
 from tqdm import tqdm
 
 from model import FlowMatchingLocalization, compute_flow_matching_loss
@@ -31,26 +32,26 @@ CONFIG = {
     # Model
     'sensor_dim': 6,
     'position_dim': 2,
-    'd_model': 256,
-    'encoder_layers': 4,
-    'velocity_layers': 4,
+    'd_model': 384,          # 30x 데이터에 맞춰 모델 확장
+    'encoder_layers': 6,
+    'velocity_layers': 6,
     'n_heads': 8,
-    'dropout': 0.1,
+    'dropout': 0.15,
 
     # Data (5걸음 기준: 250 timesteps)
-    'sequence_length': 250,  # 100 → 250 (5초, 약 5걸음)
+    'sequence_length': 250,
 
     # Training
-    'batch_size': 64,
-    'learning_rate': 1e-4,
+    'batch_size': 128,
+    'learning_rate': 5e-5,
     'weight_decay': 1e-4,
-    'epochs': 100,  # 늘림: 50 → 100
-    'warmup_steps': 4000,  # Warmup 늘림: 2000 → 4000 (천천히 시작)
-    'early_stopping_patience': 10,  # 10 epoch 동안 개선 없으면 조기 종료 (과적합 방지)
+    'epochs': 200,
+    'warmup_steps': 8000,
+    'early_stopping_patience': 15,
 
     # Top-k Loss (Hard Example Mining)
     'use_topk_loss': True,
-    'topk_ratio': 0.5,  # 상위 50% 어려운 샘플에 집중
+    'topk_ratio': 0.5,
 
     # Data Augmentation (전처리 시 적용됨, Train only)
     'augment_train': False,  # 전처리에서 이미 적용됨
@@ -121,7 +122,7 @@ class FlowMatchingDataset(Dataset):
     """
     Flow Matching용 데이터셋 (실시간 증강 지원)
 
-    Input: 센서 시퀀스 (100, 6)
+    Input: 센서 시퀀스 (T, 6) - 기본 T=250
     Target: 마지막 위치 (2,)
     """
     def __init__(self, states, trajectories, augment=False,
@@ -155,9 +156,61 @@ class FlowMatchingDataset(Dataset):
             )
 
         return {
-            'sensor_data': sensor_data,           # (100, 6)
+            'sensor_data': sensor_data,           # (T, 6)
             'position': self.positions[idx],       # (2,)
         }
+
+
+# ============================================================================
+# Utility helpers
+# ============================================================================
+def load_metadata(data_dir: Path):
+    """Load metadata.pkl if available"""
+    metadata_path = data_dir / 'metadata.pkl'
+    if not metadata_path.exists():
+        print("  ⚠️ metadata.pkl을 찾을 수 없습니다. 정규화 좌표로 평가합니다.")
+        return None
+
+    with open(metadata_path, 'rb') as f:
+        metadata = pickle.load(f)
+    return metadata
+
+
+def extract_position_bounds(metadata):
+    """
+    metadata에서 x/y 최소/최대 범위를 추출한다.
+    새로운 전처리 스크립트는 position_bounds를 제공하고,
+    기존 스크립트는 normalization에 해당 정보가 포함되어 있다.
+    """
+    if metadata is None:
+        return None
+
+    if 'position_bounds' in metadata:
+        return metadata['position_bounds']
+
+    norm = metadata.get('normalization')
+    if norm and all(k in norm for k in ('x_min', 'x_max', 'y_min', 'y_max')):
+        return {
+            'x_min': norm['x_min'],
+            'x_max': norm['x_max'],
+            'y_min': norm['y_min'],
+            'y_max': norm['y_max'],
+        }
+    return None
+
+
+def denormalize_positions_tensor(pos_tensor, bounds):
+    """(-1, 1) 정규화 좌표를 실제 (x, y)로 되돌린다."""
+    x = (pos_tensor[..., 0] + 1.0) * 0.5 * (bounds['x_max'] - bounds['x_min']) + bounds['x_min']
+    y = (pos_tensor[..., 1] + 1.0) * 0.5 * (bounds['y_max'] - bounds['y_min']) + bounds['y_min']
+    return torch.stack([x, y], dim=-1)
+
+
+def maybe_denormalize(pos_tensor, bounds):
+    """bounds가 있을 때만 denormalize"""
+    if bounds is None:
+        return pos_tensor
+    return denormalize_positions_tensor(pos_tensor, bounds)
 
 # ============================================================================
 # Training
@@ -165,8 +218,22 @@ class FlowMatchingDataset(Dataset):
 def train():
     print("\n[1/6] 데이터 로드...")
 
-    # 새로운 전처리 데이터 사용 (Train에만 시퀀셜 증강 적용됨)
-    data_dir = Path(__file__).parent / 'processed_data_flow_matching'
+    # 데이터 디렉토리 자동 선택 (합성 데이터 우선)
+    base_dir = Path(__file__).parent
+    synth_dir = base_dir / 'processed_data_flow_matching_synth'
+    default_dir = base_dir / 'processed_data_flow_matching'
+
+    if synth_dir.exists():
+        data_dir = synth_dir
+        print("  📦 Using synthetic dataset: processed_data_flow_matching_synth")
+    else:
+        data_dir = default_dir
+        print("  📦 Using default dataset: processed_data_flow_matching")
+    metadata = load_metadata(data_dir)
+    position_bounds = extract_position_bounds(metadata)
+    grid_threshold = metadata.get('grid_size') if metadata else None
+    grid_metrics_enabled = position_bounds is not None and grid_threshold is not None
+    unit_label = "m" if position_bounds is not None else "normalized units"
 
     states_train = np.load(data_dir / 'states_train.npy', allow_pickle=True)
     traj_train = np.load(data_dir / 'trajectories_train.npy', allow_pickle=True)
@@ -306,7 +373,9 @@ def train():
 
                 # Position error (using sampling)
                 pred_positions = model.sample(sensor_data, n_steps=CONFIG['inference_steps'])
-                error = torch.norm(pred_positions - positions, dim=1).mean()
+                pred_eval = maybe_denormalize(pred_positions, position_bounds)
+                target_eval = maybe_denormalize(positions, position_bounds)
+                error = torch.norm(pred_eval - target_eval, dim=1).mean()
                 val_position_error += error.item()
 
                 # Position error with Top-k sampling
@@ -317,21 +386,19 @@ def train():
                     n_steps=CONFIG['inference_steps']
                 )
                 # 최고 신뢰도 위치 오차
-                error_topk = torch.norm(best_pos - positions, dim=1).mean()
+                best_eval = maybe_denormalize(best_pos, position_bounds)
+                error_topk = torch.norm(best_eval - target_eval, dim=1).mean()
                 val_position_error_topk += error_topk.item()
 
         val_loss /= len(val_loader)
         val_position_error /= len(val_loader)
         val_position_error_topk /= len(val_loader)
 
-        # 1 Grid 이내 정확도 계산 (주변 1칸 포함)
-        grid_size_normalized = CONFIG.get('grid_size_normalized', 0.9 / 85.5)  # 정규화된 grid 크기
-
         print(f"Epoch {epoch+1:3d} | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
-              f"Val Pos Error: {val_position_error:.4f} | "
-              f"Val Pos Error (Top-k): {val_position_error_topk:.4f}")
+              f"Val Pos Error ({unit_label}): {val_position_error:.4f} | "
+              f"Val Pos Error (Top-k, {unit_label}): {val_position_error_topk:.4f}")
 
         # Save best model & Early stopping
         if val_loss < best_val_loss:
@@ -397,10 +464,6 @@ def train():
     test_within_1grid_topk = 0
     total_samples = 0
 
-    # Grid size (정규화된 좌표 기준)
-    # 원본: 0.9m, 건물 범위: 85.5m
-    grid_size_normalized = 0.9 / 85.5 * 2  # 정규화된 좌표는 -1~1 범위 (2배)
-
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Test Evaluation"):
             sensor_data = batch['sensor_data'].to(DEVICE)
@@ -408,12 +471,13 @@ def train():
 
             # 일반 sampling
             pred_positions = model.sample(sensor_data, n_steps=CONFIG['inference_steps'])
-            error = torch.norm(pred_positions - positions, dim=1)
+            pred_eval = maybe_denormalize(pred_positions, position_bounds)
+            target_eval = maybe_denormalize(positions, position_bounds)
+            error = torch.norm(pred_eval - target_eval, dim=1)
             test_position_error += error.sum().item()
 
-            # 1 Grid 이내 정확도
-            within_1grid = (error <= grid_size_normalized).sum().item()
-            test_within_1grid += within_1grid
+            if grid_metrics_enabled:
+                test_within_1grid += (error <= grid_threshold).sum().item()
 
             # Top-k sampling (5개 후보 모두 평가)
             best_pos, topk_positions, topk_scores = model.sample_topk(
@@ -422,37 +486,35 @@ def train():
                 k=CONFIG['topk_k'],
                 n_steps=CONFIG['inference_steps']
             )
-            # best_pos: (B, 2) - 최고 신뢰도 위치
-            # topk_positions: (B, 5, 2) - 5개 후보
 
             # 최고 신뢰도 위치 오차
-            error_topk = torch.norm(best_pos - positions, dim=1)
+            best_eval = maybe_denormalize(best_pos, position_bounds)
+            error_topk = torch.norm(best_eval - target_eval, dim=1)
             test_position_error_topk += error_topk.sum().item()
 
-            # 1 Grid 이내 정확도 (Top-5 중 하나라도 맞으면 정답)
-            for b in range(len(positions)):
-                # b번째 샘플의 5개 후보 각각 확인
-                target_pos = positions[b]  # (2,)
-                candidates = topk_positions[b]  # (5, 2)
-
-                # 5개 중 하나라도 1 Grid 이내면 정답
-                errors = torch.norm(candidates - target_pos, dim=1)  # (5,)
-                if (errors <= grid_size_normalized).any():
-                    test_within_1grid_topk += 1
+            if grid_metrics_enabled:
+                candidates_eval = maybe_denormalize(topk_positions, position_bounds)
+                candidate_errors = torch.norm(candidates_eval - target_eval.unsqueeze(1), dim=2)
+                test_within_1grid_topk += (candidate_errors <= grid_threshold).any(dim=1).sum().item()
 
             total_samples += len(positions)
 
     test_position_error /= total_samples
     test_position_error_topk /= total_samples
-    test_acc_1grid = test_within_1grid / total_samples * 100
-    test_acc_1grid_topk = test_within_1grid_topk / total_samples * 100
+    if grid_metrics_enabled:
+        test_acc_1grid = test_within_1grid / total_samples * 100
+        test_acc_1grid_topk = test_within_1grid_topk / total_samples * 100
 
     print(f"\n📊 Test 결과:")
-    print(f"  평균 위치 오차 (일반): {test_position_error:.4f} (정규화 단위)")
-    print(f"  평균 위치 오차 (Top-k 최고 신뢰도): {test_position_error_topk:.4f} (정규화 단위)")
-    print(f"\n  🎯 1 Grid(0.9m) 이내 정확도:")
-    print(f"    일반 샘플링 (1개): {test_acc_1grid:.2f}% ({test_within_1grid}/{total_samples})")
-    print(f"    Top-5 후보 (5개 중 하나라도): {test_acc_1grid_topk:.2f}% ({test_within_1grid_topk}/{total_samples})")
+    print(f"  평균 위치 오차 (일반): {test_position_error:.4f} {unit_label}")
+    print(f"  평균 위치 오차 (Top-k 최고 신뢰도): {test_position_error_topk:.4f} {unit_label}")
+
+    if grid_metrics_enabled:
+        print(f"\n  🎯 1 Grid({grid_threshold:.2f}m) 이내 정확도:")
+        print(f"    일반 샘플링 (1개): {test_acc_1grid:.2f}% ({test_within_1grid}/{total_samples})")
+        print(f"    Top-5 후보 (5개 중 하나라도): {test_acc_1grid_topk:.2f}% ({test_within_1grid_topk}/{total_samples})")
+    else:
+        print("\n  🎯 Grid 정확도: metadata 정보가 없어 생략되었습니다.")
 
     # ========== Test Sampling Speed ==========
     print("\n" + "=" * 70)

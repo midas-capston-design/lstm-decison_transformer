@@ -1,0 +1,6 @@
+.venv/
+.pycache/
+tmp_data/
+*.pyc
+__pycache__/
+flow_matching/processed_data_flow_matching_synth/
