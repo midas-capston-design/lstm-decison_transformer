@@ -1,0 +1,9 @@
+{
+  "feature_mode": "mag3",
+  "n_features": 3,
+  "window_size": 250,
+  "stride": 50,
+  "n_train": 8166,
+  "n_val": 2722,
+  "n_test": 2723
+}

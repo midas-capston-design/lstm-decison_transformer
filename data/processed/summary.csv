@@ -1,0 +1,4 @@
+split,count,avg_seq_len
+train,112,1641
+val,45,1698
+test,46,1714
